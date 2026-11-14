@@ -1,0 +1,240 @@
+<!doctype html>
+<!--
+  Supply Chain Dashboard: front end.
+
+  Single static page. It reads data/data.json (written by dashboard.py) and
+  renders it; it never calls a data provider directly, so no API keys ever
+  reach the browser.
+
+  Data contract (data/data.json):
+    generated         ISO 8601 UTC timestamp of the last fetch
+    fred_key_present  boolean; false triggers the missing-key banner
+    hosted            boolean; true on the published site (no Refresh button,
+                      and a warning if updates have stopped)
+    sections[]        { id, title, tiles[] }
+    tiles[]           { id, label, unit, freq, note, ref, up_is_bad, status,
+                        asof, last, prev, chg_pct, spark[], error }
+                      status is "ok" or "error"; value fields exist only when ok
+    news[]            { title, link, source, published, tags[] }
+    news_errors[]     one string per failed feed
+
+  Theming: colors are CSS custom properties on :root, with a
+  prefers-color-scheme: dark override. Change colors there only.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supply Chain Dashboard</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #1a1f27; --muted: #667085; --line: #e3e6eb;
+    --up: #b42318; --down: #067647; --neutral: #475467; --stale: #b54708; --err: #b42318;
+    --spark: #344054; --accent: #1d4ed8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151a; --card:#1a1f27; --ink:#e8ebf0; --muted:#98a2b3; --line:#2a313c;
+            --up:#f97066; --down:#47cd89; --neutral:#98a2b3; --stale:#fdb022; --err:#f97066;
+            --spark:#98a2b3; --accent:#7aa2ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.4 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { display:flex; align-items:baseline; gap:16px; padding:14px 20px; border-bottom:1px solid var(--line);
+           background:var(--card); position:sticky; top:0; z-index:2; }
+  header h1 { font-size:16px; margin:0; font-weight:650; }
+  header .meta { color:var(--muted); font-size:12px; flex:1; }
+  button { font:inherit; font-size:12px; padding:5px 10px; border:1px solid var(--line); background:var(--card);
+           color:var(--ink); border-radius:6px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .layout { display:grid; grid-template-columns: minmax(0,1fr) 340px; gap:20px; padding:20px; align-items:start; }
+  @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+  .banner { margin:12px 20px 0; padding:10px 12px; border:1px solid var(--stale); border-radius:6px;
+            color:var(--stale); font-size:13px; }
+  section { margin-bottom:22px; }
+  section h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+               margin:0 0 8px; font-weight:600; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap:10px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .tile .label { font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tile .row { display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin-top:4px; }
+  .tile .val { font-size:20px; font-weight:650; font-variant-numeric: tabular-nums; }
+  .tile .unit { font-size:11px; color:var(--muted); margin-left:4px; font-weight:400; }
+  .chg { font-size:12px; font-variant-numeric: tabular-nums; font-weight:600; }
+  .chg.bad { color:var(--up); } .chg.good { color:var(--down); } .chg.flat { color:var(--neutral); }
+  .tile svg { width:100%; height:28px; margin-top:6px; color:var(--spark); display:block; }
+  .tile .foot { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px; }
+  .tile.stale { border-color:var(--stale); }
+  .tile.stale .foot .asof { color:var(--stale); font-weight:600; }
+  .tile.error { border-color:var(--err); }
+  .tile.error .errmsg { font-size:11px; color:var(--err); margin-top:6px; word-break:break-word; }
+  aside { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; position:sticky; top:64px;
+          max-height:calc(100vh - 84px); overflow:auto; }
+  aside h2 { margin:0 0 8px; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+  .chip { padding:3px 9px; border-radius:999px; font-size:12px; }
+  .chip.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .news a { color:var(--ink); text-decoration:none; font-weight:550; }
+  .news a:hover { color:var(--accent); text-decoration:underline; }
+  .news li { list-style:none; padding:8px 0; border-top:1px solid var(--line); }
+  .news ul { margin:0; padding:0; }
+  .news .m { font-size:11px; color:var(--muted); margin-top:2px; }
+  .empty { color:var(--muted); padding:30px 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Supply Chain Dashboard</h1>
+  <div class="meta" id="meta">Loading...</div>
+  <button id="refresh">Refresh data</button>
+</header>
+<div id="banner"></div>
+<div class="layout">
+  <main id="main"><div class="empty">Loading...</div></main>
+  <aside class="news">
+    <h2>News</h2>
+    <div class="chips" id="chips"></div>
+    <ul id="news"></ul>
+  </aside>
+</div>
+<script>
+/**
+ * Days of age after which a tile is flagged stale, by update frequency.
+ * Set above the normal publishing gap so weekends, holidays, and lagged
+ * monthly releases do not raise false alarms.
+ * @type {Object<string, number>}
+ */
+const STALE_DAYS = { daily: 6, weekly: 16, monthly: 70 };
+
+/** Hours since the last update after which the published site warns. */
+const HOSTED_STALE_HOURS = 5;
+
+/** @type {?Object} Parsed data/data.json, or null before the first load. */
+let DATA = null;
+
+/** @type {string} Active news filter chip; "All" shows everything. */
+let FILTER = "All";
+
+/**
+ * Escape a value for safe insertion into HTML. Feed headlines and error
+ * messages are untrusted text, so everything interpolated into markup goes
+ * through this.
+ * @param {*} s
+ * @returns {string}
+ */
+const esc = s =>String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/**
+ * Format a number for display: no decimals from 1,000 up, two below.
+ * @param {number} v
+ * @returns {string}
+ */
+const fmt = v =>Math.abs(v) >= 1000 ? v.toLocaleString(undefined, {maximumFractionDigits:0})
+                                     : v.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+
+/**
+ * Build an inline SVG sparkline. Each tile is scaled to its own min and max,
+ * so lines compare shape within a tile, never magnitude between tiles.
+ * @param {number[]} vals Oldest to newest.
+ * @returns {string} SVG markup, or "" when there are fewer than 2 points.
+ */
+function spark(vals) {
+  if (!vals || vals.length < 2) return "";
+  const min = Math.min(...vals), max = Math.max(...vals), span = max - min || 1;
+  const pts = vals.map((v, i) => `${(i/(vals.length-1)*100).toFixed(2)},${(26 - (v-min)/span*24).toFixed(2)}`).join(" ");
+  return `<svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-hidden="true">
+    <polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+/**
+ * Age of an observation in days.
+ * @param {string} asof Date as YYYY-MM-DD (treated as UTC).
+ * @returns {number}
+ */
+function ageDays(asof) { return (Date.now() - new Date(asof + "T00:00:00Z").getTime()) / 86400000; }
+
+/**
+ * Render one tile. Error tiles show the failure reason instead of a value.
+ * Change color encodes cost impact, not direction: when t.up_is_bad is true a
+ * rise is red; when false (equities, volume indexes) a rise is green.
+ * @param {Object} t A tile object from data.json.
+ * @returns {string} HTML.
+ */
+function tileHtml(t) {
+  if (t.status !== "ok") {
+    return `<div class="tile error"><div class="label">${esc(t.label)}</div>
+      <div class="errmsg">No data: ${esc(t.error || "unknown error")}</div></div>`;
+  }
+  const stale = ageDays(t.asof) > (STALE_DAYS[t.freq] || 6);
+  const c = t.chg_pct;
+  let cls = "flat", arrow = "";
+  if (c !== null && Math.abs(c) >= 0.005) {
+    arrow = c > 0 ? "▲" : "▼";
+    cls = (c > 0) === t.up_is_bad ? "bad" : "good";
+  }
+  const chg = c === null ? "" : `<span class="chg ${cls}">${arrow} ${Math.abs(c).toFixed(2)}%</span>`;
+  return `<div class="tile ${stale ? "stale" : ""}" title="${esc(t.ref)}${t.note ? " | " + esc(t.note) : ""}">
+    <div class="label">${esc(t.label)}</div>
+    <div class="row"><div class="val">${fmt(t.last)}<span class="unit">${esc(t.unit)}</span></div>${chg}</div>
+    ${spark(t.spark)}
+    <div class="foot"><span class="asof">${stale ? "STALE " : ""}${esc(t.asof)}</span><span>${esc(t.freq)}</span></div>
+  </div>`;
+}
+
+/** Render the whole page (banner, tiles, news chips, news list) from DATA. */
+function render() {
+  const d = DATA;
+  document.getElementById("meta").textContent =
+    "Last fetch " + new Date(d.generated).toLocaleString() + ". Red = cost pressure up, green = down (equities: green = up).";
+  const hoursOld = (Date.now() - new Date(d.generated).getTime()) / 3600000;
+  const keyMsg = !d.fred_key_present
+    ? `<div class="banner">No FRED API key found. Add your key as FRED_API_KEY in a .env file next to dashboard.py and restart. Yahoo and news still work without it.</div>` : "";
+  const staleMsg = d.hosted && hoursOld > HOSTED_STALE_HOURS
+    ? `<div class="banner">Data may be out of date: the last update was ${Math.round(hoursOld)} hours ago, so scheduled updates may have stopped.</div>` : "";
+  document.getElementById("banner").innerHTML = keyMsg + staleMsg;
+  document.getElementById("refresh").style.display = d.hosted ? "none" : "";
+  document.getElementById("main").innerHTML = d.sections.map(s =>
+    `<section><h2>${esc(s.title)}</h2><div class="grid">${s.tiles.map(tileHtml).join("")}</div></section>`).join("");
+
+  const tags = ["All", ...new Set(d.news.flatMap(n => n.tags))].sort((a, b) => a === "All" ? -1 : b === "All" ? 1 : a.localeCompare(b));
+  document.getElementById("chips").innerHTML = tags.map(t =>
+    `<button class="chip ${t === FILTER ? "on" : ""}" data-t="${esc(t)}">${esc(t)}</button>`).join("");
+  const items = d.news.filter(n => FILTER === "All" || n.tags.includes(FILTER));
+  document.getElementById("news").innerHTML = items.length ? items.map(n => {
+    const when = n.published ? new Date(n.published).toLocaleDateString(undefined, {month:"short", day:"numeric"}) : "";
+    return `<li><a href="${esc(n.link)}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>
+      <div class="m">${esc(n.source)}${when ? " | " + when : ""}</div></li>`;
+  }).join("") : `<li class="m">No items.${d.news_errors.length ? " Feed errors: " + esc(d.news_errors.join("; ")) : ""}</li>`;
+}
+
+/**
+ * Fetch data/data.json and render it. If the file does not exist yet (first
+ * launch, first fetch still running) show a waiting message and retry in 10 s.
+ * @returns {Promise<void>}
+ */
+async function load() {
+  try {
+    const r = await fetch("data/data.json?" + Date.now());
+    if (!r.ok) throw new Error(r.status);
+    DATA = await r.json();
+    render();
+  } catch (e) {
+    document.getElementById("main").innerHTML =
+      `<div class="empty">First fetch is probably still running. Reload in about 30 seconds.</div>`;
+    setTimeout(load, 10000);
+  }
+}
+
+document.getElementById("chips").addEventListener("click", e => {
+  if (e.target.dataset.t) { FILTER = e.target.dataset.t; render(); }
+});
+document.getElementById("refresh").addEventListener("click", async e => {
+  e.target.disabled = true; e.target.textContent = "Fetching...";
+  try { await fetch("/refresh"); } catch (_) {}
+  await load();
+  e.target.disabled = false; e.target.textContent = "Refresh data";
+});
+load();
+setInterval(load, 15 * 60 * 1000);
+</script>
+</body>
+</html>
